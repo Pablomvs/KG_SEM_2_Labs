@@ -1,0 +1,30 @@
+# Build output
+x64/
+x86/
+Debug/
+Release/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.dll
+*.exp
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.aps
+*.ncb
+*.sdf
+*.opensdf
+ipch/
+
+# NuGet packages (можно восстановить через VS)
+packages/
+
+# Временные файлы
+*.tmp
+*.log
+Thumbs.db
