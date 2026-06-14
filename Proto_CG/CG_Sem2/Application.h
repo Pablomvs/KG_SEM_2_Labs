@@ -3,7 +3,7 @@
 
 #include "Win32Window.h"
 #include "GameTimer.h"
-#include "D3D12Context.h"
+#include "RenderingSystem.h"
 #include "InputDevice.h"
 
 class Application
@@ -15,19 +15,11 @@ public:
     int  Run();
 
 private:
-    HINSTANCE   m_hInstance{};
-    int         m_nCmdShow{};
+    HINSTANCE m_hInstance{};
+    int       m_nCmdShow{};
 
-    Win32Window  m_window;
-    GameTimer    m_timer;
-    D3D12Context m_dx12;
-    InputDevice  m_input;
-
-    float m_scrollU = 0.0f;
-    float m_scrollV = 0.0f;
-
-    bool m_prevW = false;
-    bool m_prevA = false;
-    bool m_prevS = false;
-    bool m_prevD = false;
+    Win32Window     m_window;
+    GameTimer       m_timer;
+    RenderingSystem m_renderingSystem;
+    InputDevice     m_input;
 };

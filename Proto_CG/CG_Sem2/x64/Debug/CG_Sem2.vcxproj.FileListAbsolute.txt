@@ -6,3 +6,4 @@ C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\x64\Debug\D3D12\D3D12Core.dll
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\x64\Debug\D3D12\D3D12Core.pdb
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\x64\Debug\D3D12\D3D12SDKLayers.dll
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\x64\Debug\D3D12\D3D12SDKLayers.pdb
+C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\CG_Sem2.exe
