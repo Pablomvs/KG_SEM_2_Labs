@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <d3dcompiler.h>
 #include <vector>
+#include <unordered_map>
 #include <wrl.h> 
 #include <cstring>
 #include <cmath>
@@ -154,45 +155,60 @@ bool D3D12Context::Initialize(HWND hwnd, UINT width, UINT height)
     }
     nextSrv++;
 
-    // 11.2 material textures -> srv 1.. (но не больше MaxSrvCount-1)
+    
     if (modelLoaded && !m_materialDiffusePaths.empty())
     {
+        
         m_materialToSrv.assign(m_materialDiffusePaths.size(), 0);
+
+        
+        std::unordered_map<std::string, UINT> pathToSrv;
 
         for (size_t i = 0; i < m_materialDiffusePaths.size(); ++i)
         {
             const std::string& rel = m_materialDiffusePaths[i];
+
+           
             if (rel.empty())
             {
                 m_materialToSrv[i] = 0;
                 continue;
             }
 
+         
+            auto cached = pathToSrv.find(rel);
+            if (cached != pathToSrv.end())
+            {
+                m_materialToSrv[i] = cached->second;
+                continue;
+            }
+
+           
             if (nextSrv >= MaxSrvCount)
             {
-                // места в heap больше нет — fallback на default
                 m_materialToSrv[i] = 0;
                 continue;
             }
 
-            // ВАЖНО: tinyobj может давать "textures/xxx.jpg"
-            // fullPath станет models\textures\xxx.jpg
+            
             std::string fullPath = modelsDir + rel;
-
             OutputDebugStringA(("TRY LOAD: " + fullPath + "\n").c_str());
 
+            
             if (CreateTextureFromFile(fullPath.c_str(), nextSrv))
             {
                 m_materialToSrv[i] = nextSrv;
+                pathToSrv[rel] = nextSrv;     
                 nextSrv++;
             }
             else
             {
-                m_materialToSrv[i] = 0; // default
+                
+                m_materialToSrv[i] = 0;
             }
         }
 
-        // назначаем srv сабмешам
+        
         for (auto& sm : m_submeshes)
         {
             if (sm.MaterialId >= 0 && sm.MaterialId < (int)m_materialToSrv.size())
@@ -203,12 +219,12 @@ bool D3D12Context::Initialize(HWND hwnd, UINT width, UINT height)
     }
     else
     {
-        // нет материалов — все сабмеши на default srv0
+        
         for (auto& sm : m_submeshes)
             sm.SrvIndex = 0;
     }
 
-    // 12) Execute texture upload command list
+    
     if (FAILED(m_commandList->Close())) {
         MessageBoxW(nullptr, L"CommandList Close FAILED", L"DX12", MB_OK);
         return false;
@@ -457,7 +473,7 @@ bool D3D12Context::CreateTextureFromFile(const char* filePath, UINT srvIndex)
     // 0) Проверка что srvIndex влезает в heap (хотя бы грубо)
     // (в D3D12 нельзя прочитать NumDescriptors у heap, так что просто sanity-check)
 
-    // 1) Load image via stb_image (force RGBA8)
+    // 1) Load image via stb_image (force RGBA)
     int w = 0, h = 0, comp = 0;
     stbi_uc* pixels = stbi_load(filePath, &w, &h, &comp, 4);
     if (!pixels || w <= 0 || h <= 0)
@@ -489,7 +505,7 @@ bool D3D12Context::CreateTextureFromFile(const char* filePath, UINT srvIndex)
         &defaultHeap,
         D3D12_HEAP_FLAG_NONE,
         &texDesc,
-        D3D12_RESOURCE_STATE_COPY_DEST,  // важно: сначала COPY_DEST
+        D3D12_RESOURCE_STATE_COPY_DEST,  
         nullptr,
         IID_PPV_ARGS(&texture));
 

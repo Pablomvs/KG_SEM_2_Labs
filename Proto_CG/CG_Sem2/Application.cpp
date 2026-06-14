@@ -28,8 +28,8 @@ bool Application::Initialize()
         return false;
     }
 
-    m_dx12.SetUVTiling(4.0f, 4.0f);          
-    m_dx12.SetUVScrollSpeed(0.0f, 1.0f);
+    m_dx12.SetUVTiling(4.0f, 4.0f);
+    m_dx12.SetUVScrollSpeed(0.0f, 0.0f);
 
     m_timer.Reset();
     return true;
@@ -79,6 +79,20 @@ int Application::Run()
             dolly,
             (float)mouseDeltaX,
             (float)mouseDeltaY);
+
+        // WASD — смена направления скролла по нажатию (не удержанию)
+        const float scrollSpeed = 1.0f;
+        bool curW = m_input.IsKeyDown('W');
+        bool curA = m_input.IsKeyDown('A');
+        bool curS = m_input.IsKeyDown('S');
+        bool curD = m_input.IsKeyDown('D');
+
+        if (curW && !m_prevW) { m_scrollU =  0.0f; m_scrollV = -scrollSpeed; m_dx12.SetUVScrollSpeed(m_scrollU, m_scrollV); }
+        if (curS && !m_prevS) { m_scrollU =  0.0f; m_scrollV = +scrollSpeed; m_dx12.SetUVScrollSpeed(m_scrollU, m_scrollV); }
+        if (curA && !m_prevA) { m_scrollU = -scrollSpeed; m_scrollV = 0.0f;  m_dx12.SetUVScrollSpeed(m_scrollU, m_scrollV); }
+        if (curD && !m_prevD) { m_scrollU = +scrollSpeed; m_scrollV = 0.0f;  m_dx12.SetUVScrollSpeed(m_scrollU, m_scrollV); }
+
+        m_prevW = curW; m_prevA = curA; m_prevS = curS; m_prevD = curD;
 
         m_dx12.SetTime(m_timer.TotalTime());
 

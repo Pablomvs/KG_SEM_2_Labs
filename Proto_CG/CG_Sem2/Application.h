@@ -22,4 +22,12 @@ private:
     GameTimer    m_timer;
     D3D12Context m_dx12;
     InputDevice  m_input;
+
+    float m_scrollU = 0.0f;
+    float m_scrollV = 0.0f;
+
+    bool m_prevW = false;
+    bool m_prevA = false;
+    bool m_prevS = false;
+    bool m_prevD = false;
 };

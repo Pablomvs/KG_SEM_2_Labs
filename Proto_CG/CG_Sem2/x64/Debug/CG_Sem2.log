@@ -1,11 +1,4 @@
 ﻿  Application.cpp
-  CubeGeometry.cpp
-  D3D12Context.cpp
-  GameTimer.cpp
-  InputDevice.cpp
   main.cpp
-  tiny_obj_loader.cc
-  Vertex.cpp
-  Win32Window.cpp
   Создание кода...
   CG_Sem2.vcxproj -> C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\x64\Debug\CG_Sem2.exe
