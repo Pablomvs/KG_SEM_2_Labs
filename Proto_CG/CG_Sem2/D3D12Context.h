@@ -75,6 +75,10 @@ public:
     DirectX::XMFLOAT3 GetSceneCenter() const;
     DirectX::XMFLOAT3 GetSceneExtents() const;
 
+    DirectX::XMFLOAT4X4 GetViewMatrix() const;
+    DirectX::XMFLOAT4X4 GetProjMatrix() const;
+    void DrawMeshForShadow(ID3D12GraphicsCommandList* commandList);
+
 private:
 
     float   m_time = 0.0f; // текущее время сцены
@@ -176,4 +180,7 @@ private:
     UINT m_normalMapSrvIndex = 0;
     UINT m_baseColorSrvIndex = 0;
     UINT m_roughnessSrvIndex = 0;
+
+    DirectX::XMFLOAT4X4 m_viewMatrix{};
+    DirectX::XMFLOAT4X4 m_projMatrix{};
 };

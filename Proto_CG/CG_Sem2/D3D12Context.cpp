@@ -281,6 +281,9 @@ void D3D12Context::UpdateCB()
             1.0f,
             20000.0f);
 
+    XMStoreFloat4x4(&m_viewMatrix, view);
+    XMStoreFloat4x4(&m_projMatrix, proj);
+
     XMStoreFloat4x4(&m_cbData.World, XMMatrixTranspose(world));
     XMStoreFloat4x4(&m_cbData.View, XMMatrixTranspose(view));
     XMStoreFloat4x4(&m_cbData.Proj, XMMatrixTranspose(proj));
@@ -1696,6 +1699,24 @@ DirectX::XMFLOAT3 D3D12Context::GetSceneExtents() const
         0.5f * (m_sceneBoundsMax.x - m_sceneBoundsMin.x),
         0.5f * (m_sceneBoundsMax.y - m_sceneBoundsMin.y),
         0.5f * (m_sceneBoundsMax.z - m_sceneBoundsMin.z));
+}
+
+DirectX::XMFLOAT4X4 D3D12Context::GetViewMatrix() const
+{
+    return m_viewMatrix;
+}
+
+DirectX::XMFLOAT4X4 D3D12Context::GetProjMatrix() const
+{
+    return m_projMatrix;
+}
+
+void D3D12Context::DrawMeshForShadow(ID3D12GraphicsCommandList* commandList)
+{
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList->IASetVertexBuffers(0, 1, &m_vbView);
+    commandList->IASetIndexBuffer(&m_ibView);
+    commandList->DrawIndexedInstanced(m_indexCount, 1, 0, 0, 0);
 }
 
 void D3D12Context::SetTime(float t)

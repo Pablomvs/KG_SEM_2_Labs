@@ -15,10 +15,22 @@ cbuffer DeferredLightCB : register(b0)
     float4x4 InvProj;
 };
 
+cbuffer CascadeShadowCB : register(b1)
+{
+    float4x4 LightViewProj[3];
+    float4   CascadeSplits;
+};
+
 Texture2D<float4> GAlbedoSpec : register(t0);
-Texture2D<float4> GWorldPos : register(t1);
-Texture2D<float4> GNormal : register(t2);
-Texture2D<float4> GDepth : register(t3);
+Texture2D<float4> GWorldPos   : register(t1);
+Texture2D<float4> GNormal     : register(t2);
+Texture2D<float4> GDepth      : register(t3);
+
+Texture2D<float>  ShadowMap0  : register(t4);
+Texture2D<float>  ShadowMap1  : register(t5);
+Texture2D<float>  ShadowMap2  : register(t6);
+
+SamplerComparisonState ShadowSampler : register(s0);
 
 struct PSInput
 {
@@ -103,6 +115,34 @@ float3 EvaluateLight(
     return (diffuse + specular) * radiance * NdotL;
 }
 
+float SampleShadowPCF(Texture2D<float> shadowMap, float4x4 lightVP, float3 worldPos)
+{
+    float4 lsp = mul(float4(worldPos, 1.0f), lightVP);
+    lsp.xyz /= lsp.w;
+
+    float2 uv;
+    uv.x =  lsp.x * 0.5f + 0.5f;
+    uv.y = -lsp.y * 0.5f + 0.5f;
+
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f)
+        return 1.0f;
+
+    float compareZ = lsp.z - 0.002f;
+    float texel = 1.0f / 2048.0f;
+    float shadow = 0.0f;
+    [unroll]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        [unroll]
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            shadow += shadowMap.SampleCmpLevelZero(
+                ShadowSampler, uv + float2(dx, dy) * texel, compareZ);
+        }
+    }
+    return shadow / 9.0f;
+}
+
 float4 PSMain(PSInput input) : SV_TARGET
 {
     int2 pixelPos = int2(input.Position.xy);
@@ -131,8 +171,20 @@ float4 PSMain(PSInput input) : SV_TARGET
     float3 ambientSpecular = FresnelSchlick(saturate(dot(normal, V)), ambientF0) * lerp(0.015f, 0.11f, smoothness) * lerp(0.55f, 1.15f, upFactor);
     lit += ambientSpecular;
 
+    // Выбор каскада по линейной глубине из GBuffer
+    float viewZ = depth * 20000.0f;
+    float shadowFactor;
+    if (viewZ < CascadeSplits.x)
+        shadowFactor = SampleShadowPCF(ShadowMap0, LightViewProj[0], worldPos);
+    else if (viewZ < CascadeSplits.y)
+        shadowFactor = SampleShadowPCF(ShadowMap1, LightViewProj[1], worldPos);
+    else if (viewZ < CascadeSplits.z)
+        shadowFactor = SampleShadowPCF(ShadowMap2, LightViewProj[2], worldPos);
+    else
+        shadowFactor = 1.0f;
+
     float3 directionalL = normalize(-LightDirection.xyz);
-    float3 directionalRadiance = LightColor.rgb * LightColor.a;
+    float3 directionalRadiance = LightColor.rgb * LightColor.a * shadowFactor;
     lit += EvaluateLight(albedo, roughness, normal, V, directionalL, directionalRadiance);
 
     const int pointCount = (int)LightCounts.x;

@@ -93,6 +93,27 @@ void RenderingSystem::Shutdown()
     m_instancedPS.Reset();
     m_octree.reset();
 
+    if (m_shadowPassCBMapped && m_shadowPassCB)
+    {
+        m_shadowPassCB->Unmap(0, nullptr);
+        m_shadowPassCBMapped = nullptr;
+    }
+    if (m_cascadeShadowCBMapped && m_cascadeShadowCB)
+    {
+        m_cascadeShadowCB->Unmap(0, nullptr);
+        m_cascadeShadowCBMapped = nullptr;
+    }
+    m_shadowPassCB.Reset();
+    m_cascadeShadowCB.Reset();
+    for (UINT c = 0; c < NumCascades; c++) m_shadowMaps[c].Reset();
+    m_shadowDSVHeap.Reset();
+    m_lightingSRVHeap.Reset();
+    m_shadowTerrainPSO.Reset();
+    m_shadowInstancedPSO.Reset();
+    m_shadowRootSig.Reset();
+    m_shadowTerrainVS.Reset();
+    m_shadowInstancedVS.Reset();
+
     m_deferredLightConstantBuffer.Reset();
     m_deferredGeometryPSO.Reset();
     m_deferredLightingPSO.Reset();
@@ -196,6 +217,9 @@ void RenderingSystem::RenderDeferredFrame()
     }
 
     m_context.BeginFrame();
+    CullAndUpdateInstances();
+    ComputeCascades();
+    RenderShadowPass();
     RenderOpaqueStage();
     RenderLightingStage();
     RenderGBufferDebugOverlay();
@@ -209,9 +233,6 @@ void RenderingSystem::RenderOpaqueStage()
     D3D12_VIEWPORT vp = m_context.GetViewport();
     D3D12_RECT sc = m_context.GetScissorRect();
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = m_context.GetDepthStencilView();
-
-    // Отсечение до начала прохода геометрии
-    CullAndUpdateInstances();
 
     commandList->RSSetViewports(1, &vp);
     commandList->RSSetScissorRects(1, &sc);
@@ -255,10 +276,18 @@ void RenderingSystem::RenderLightingStage()
     commandList->SetPipelineState(m_deferredLightingPSO.Get());
     commandList->SetGraphicsRootSignature(m_deferredLightingRootSignature.Get());
 
-    ID3D12DescriptorHeap* heaps[] = { m_gbuffer.GetSRVHeap() };
+    ID3D12DescriptorHeap* heaps[] = { m_lightingSRVHeap.Get() };
     commandList->SetDescriptorHeaps(1, heaps);
-    commandList->SetGraphicsRootDescriptorTable(0, m_gbuffer.GetSRVGPU(GBuffer::Slot::AlbedoSpec));
+
+    D3D12_GPU_DESCRIPTOR_HANDLE heapStart = m_lightingSRVHeap->GetGPUDescriptorHandleForHeapStart();
+    commandList->SetGraphicsRootDescriptorTable(0, heapStart);
     commandList->SetGraphicsRootConstantBufferView(1, m_deferredLightConstantBuffer->GetGPUVirtualAddress());
+
+    D3D12_GPU_DESCRIPTOR_HANDLE shadowStart = heapStart;
+    shadowStart.ptr += GBuffer::TargetCount * m_lightingSRVDescSize;
+    commandList->SetGraphicsRootDescriptorTable(2, shadowStart);
+    commandList->SetGraphicsRootConstantBufferView(3, m_cascadeShadowCB->GetGPUVirtualAddress());
+
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList->DrawInstanced(3, 1, 0, 0);
 }
@@ -277,7 +306,8 @@ bool RenderingSystem::InitializeDeferredResources()
         CreateDebugOverlayRootSignature() &&
         CreateDebugOverlayPipeline() &&
         CreateLightingConstantBuffer() &&
-        InitializeInstancedObjects();
+        InitializeInstancedObjects() &&
+        InitializeShadowResources();
 }
 
 bool RenderingSystem::CompileDeferredShaders()
@@ -418,43 +448,69 @@ bool RenderingSystem::CompileDeferredShaders()
 // что может читать шейдер
 bool RenderingSystem::CreateDeferredLightingRootSignature()
 {
-    D3D12_DESCRIPTOR_RANGE srvRange{};
-    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange.NumDescriptors = GBuffer::TargetCount;
-    srvRange.BaseShaderRegister = 0;
-    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    // t0-t3: GBuffer
+    D3D12_DESCRIPTOR_RANGE gbufRange{};
+    gbufRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    gbufRange.NumDescriptors = GBuffer::TargetCount;
+    gbufRange.BaseShaderRegister = 0;
+    gbufRange.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER rootParams[2]{};
+    // t4-t6: shadow maps
+    D3D12_DESCRIPTOR_RANGE shadowRange{};
+    shadowRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    shadowRange.NumDescriptors = NumCascades;
+    shadowRange.BaseShaderRegister = 4;
+    shadowRange.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER rootParams[4]{};
+    // 0: GBuffer SRV table
     rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
-    rootParams[0].DescriptorTable.pDescriptorRanges = &srvRange;
+    rootParams[0].DescriptorTable.pDescriptorRanges = &gbufRange;
     rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
+    // 1: DeferredLightCB (b0)
     rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rootParams[1].Descriptor.ShaderRegister = 0;
     rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // 2: shadow SRV table
+    rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
+    rootParams[2].DescriptorTable.pDescriptorRanges = &shadowRange;
+    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // 3: CascadeShadowCB (b1)
+    rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[3].Descriptor.ShaderRegister = 1;
+    rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    // Статический сэмплер сравнения (PCF)
+    D3D12_STATIC_SAMPLER_DESC shadowSampler{};
+    shadowSampler.Filter           = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    shadowSampler.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    shadowSampler.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    shadowSampler.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    shadowSampler.ComparisonFunc   = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    shadowSampler.BorderColor      = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    shadowSampler.ShaderRegister   = 0;
+    shadowSampler.RegisterSpace    = 0;
+    shadowSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    shadowSampler.MaxLOD           = D3D12_FLOAT32_MAX;
 
     D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = 2;
-    desc.pParameters = rootParams;
-    desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    desc.NumParameters     = 4;
+    desc.pParameters       = rootParams;
+    desc.NumStaticSamplers = 1;
+    desc.pStaticSamplers   = &shadowSampler;
+    desc.Flags             = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     ComPtr<ID3DBlob> serialized;
     ComPtr<ID3DBlob> error;
     HRESULT hr = D3D12SerializeRootSignature(
-        &desc,
-        D3D_ROOT_SIGNATURE_VERSION_1,
-        &serialized,
-        &error);
+        &desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
     if (FAILED(hr))
-    {
         return false;
-    }
 
     return SUCCEEDED(m_context.GetDevice()->CreateRootSignature(
-        0,
-        serialized->GetBufferPointer(),
-        serialized->GetBufferSize(),
+        0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
         IID_PPV_ARGS(&m_deferredLightingRootSignature)));
 }
 
@@ -1071,5 +1127,477 @@ void RenderingSystem::RenderInstances(ID3D12GraphicsCommandList* commandList)
     commandList->IASetIndexBuffer(&m_cubeIBView);
     commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList->DrawIndexedInstanced(m_cubeIndexCount, (UINT)m_visibleObjects.size(), 0, 0, 0);
+}
+
+// ============================================================
+// Каскадные карты теней (CSM + PCF)
+// ============================================================
+
+bool RenderingSystem::InitializeShadowResources()
+{
+    auto* device = m_context.GetDevice();
+    m_lightingSRVDescSize = device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    // 1. Объединённый SRV heap: 4 GBuffer + 3 shadow
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = GBuffer::TargetCount + NumCascades;
+        hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_lightingSRVHeap))))
+            return false;
+    }
+
+    // 2. Копируем GBuffer SRV в позиции 0-3
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dst =
+            m_lightingSRVHeap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < GBuffer::TargetCount; ++i)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE src =
+                m_gbuffer.GetSRV(static_cast<GBuffer::Slot>(i));
+            device->CopyDescriptorsSimple(1, dst, src,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            dst.ptr += m_lightingSRVDescSize;
+        }
+    }
+
+    // 3. Создаём текстуры shadow map (R32_TYPELESS)
+    {
+        D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width            = ShadowMapSize;
+        rd.Height           = ShadowMapSize;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = DXGI_FORMAT_R32_TYPELESS;
+        rd.SampleDesc.Count = 1;
+        rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+        D3D12_CLEAR_VALUE cv{};
+        cv.Format               = DXGI_FORMAT_D32_FLOAT;
+        cv.DepthStencil.Depth   = 1.0f;
+
+        for (UINT c = 0; c < NumCascades; ++c)
+        {
+            if (FAILED(device->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                IID_PPV_ARGS(&m_shadowMaps[c]))))
+                return false;
+        }
+    }
+
+    // 4. DSV heap (3 слота)
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        hd.NumDescriptors = NumCascades;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_shadowDSVHeap))))
+            return false;
+
+        UINT dsvSize = device->GetDescriptorHandleIncrementSize(
+            D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle =
+            m_shadowDSVHeap->GetCPUDescriptorHandleForHeapStart();
+
+        for (UINT c = 0; c < NumCascades; ++c)
+        {
+            D3D12_DEPTH_STENCIL_VIEW_DESC dsvd{};
+            dsvd.Format        = DXGI_FORMAT_D32_FLOAT;
+            dsvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            device->CreateDepthStencilView(m_shadowMaps[c].Get(), &dsvd, dsvHandle);
+            dsvHandle.ptr += dsvSize;
+        }
+    }
+
+    // 5. SRV для shadow map в позиции 4-6 объединённого heap
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE srvBase =
+            m_lightingSRVHeap->GetCPUDescriptorHandleForHeapStart();
+        srvBase.ptr += GBuffer::TargetCount * m_lightingSRVDescSize;
+
+        for (UINT c = 0; c < NumCascades; ++c)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
+            srvd.Format                    = DXGI_FORMAT_R32_FLOAT;
+            srvd.ViewDimension             = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvd.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvd.Texture2D.MipLevels       = 1;
+
+            D3D12_CPU_DESCRIPTOR_HANDLE h = srvBase;
+            h.ptr += c * m_lightingSRVDescSize;
+            device->CreateShaderResourceView(m_shadowMaps[c].Get(), &srvd, h);
+        }
+    }
+
+    // 6. Shadow pass CB: NumCascades слотов по 256 байт
+    {
+        const UINT slotSize  = 256u; // sizeof(XMFLOAT4X4)=64 выровнено до 256
+        const UINT totalSize = slotSize * NumCascades;
+
+        D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width            = totalSize;
+        rd.Height           = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        if (FAILED(device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&m_shadowPassCB))))
+            return false;
+
+        m_shadowPassCB->Map(0, nullptr,
+            reinterpret_cast<void**>(&m_shadowPassCBMapped));
+    }
+
+    // 7. Cascade shadow CB для lighting pass
+    {
+        const UINT cbSize = (sizeof(CascadeShadowCB) + 255) & ~255u;
+
+        D3D12_HEAP_PROPERTIES hp{ D3D12_HEAP_TYPE_UPLOAD };
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width            = cbSize;
+        rd.Height           = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        if (FAILED(device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&m_cascadeShadowCB))))
+            return false;
+
+        m_cascadeShadowCB->Map(0, nullptr,
+            reinterpret_cast<void**>(&m_cascadeShadowCBMapped));
+    }
+
+    return CompileShadowShaders() &&
+           CreateShadowRootSignature() &&
+           CreateShadowPipelines();
+}
+
+bool RenderingSystem::CompileShadowShaders()
+{
+    UINT flags = 0;
+#if defined(_DEBUG)
+    flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+    wchar_t path[MAX_PATH];
+    if (!ResolveShaderPath(L"ShadowMap.hlsl", path, MAX_PATH))
+        return false;
+
+    ComPtr<ID3DBlob> err;
+    HRESULT hr = D3DCompileFromFile(path, nullptr,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "VSMain", "vs_5_0", flags, 0, &m_shadowTerrainVS, &err);
+    if (FAILED(hr))
+    {
+        if (err) OutputDebugStringA((char*)err->GetBufferPointer());
+        return false;
+    }
+
+    hr = D3DCompileFromFile(path, nullptr,
+        D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "VSMainInstanced", "vs_5_0", flags, 0, &m_shadowInstancedVS, &err);
+    if (FAILED(hr))
+    {
+        if (err) OutputDebugStringA((char*)err->GetBufferPointer());
+        return false;
+    }
+    return true;
+}
+
+bool RenderingSystem::CreateShadowRootSignature()
+{
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    param.Descriptor.ShaderRegister = 0;
+    param.ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters = 1;
+    desc.pParameters   = &param;
+    desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> serialized, error;
+    HRESULT hr = D3D12SerializeRootSignature(
+        &desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error);
+    if (FAILED(hr)) return false;
+
+    return SUCCEEDED(m_context.GetDevice()->CreateRootSignature(
+        0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+        IID_PPV_ARGS(&m_shadowRootSig)));
+}
+
+bool RenderingSystem::CreateShadowPipelines()
+{
+    auto* device = m_context.GetDevice();
+
+    // Общий rasterizer для shadow pass (bias чтобы убрать acne)
+    D3D12_RASTERIZER_DESC raster{};
+    raster.FillMode              = D3D12_FILL_MODE_SOLID;
+    raster.CullMode              = D3D12_CULL_MODE_BACK;
+    raster.DepthBias             = 5000;
+    raster.SlopeScaledDepthBias  = 2.0f;
+    raster.DepthClipEnable       = TRUE;
+
+    D3D12_DEPTH_STENCIL_DESC dsState{};
+    dsState.DepthEnable    = TRUE;
+    dsState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    dsState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS;
+
+    // --- PSO для ландшафта (POSITION, NORMAL, TEXCOORD) ---
+    {
+        D3D12_INPUT_ELEMENT_DESC layout[] =
+        {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+        pso.InputLayout            = { layout, _countof(layout) };
+        pso.pRootSignature         = m_shadowRootSig.Get();
+        pso.VS                     = { m_shadowTerrainVS->GetBufferPointer(),
+                                       m_shadowTerrainVS->GetBufferSize() };
+        pso.PrimitiveTopologyType  = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.SampleMask             = UINT_MAX;
+        pso.RasterizerState        = raster;
+        pso.DepthStencilState      = dsState;
+        pso.NumRenderTargets       = 0;
+        pso.DSVFormat              = DXGI_FORMAT_D32_FLOAT;
+        pso.SampleDesc.Count       = 1;
+
+        if (FAILED(device->CreateGraphicsPipelineState(
+                &pso, IID_PPV_ARGS(&m_shadowTerrainPSO))))
+            return false;
+    }
+
+    // --- PSO для инстансинга (stream 0 + stream 1) ---
+    {
+        D3D12_INPUT_ELEMENT_DESC layout[] =
+        {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,   0 },
+            { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
+              D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,   0 },
+            { "IPOS",     0, DXGI_FORMAT_R32G32B32_FLOAT, 1,  0,
+              D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+            { "ISCALE",   0, DXGI_FORMAT_R32_FLOAT,       1, 12,
+              D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+            { "IYAW",     0, DXGI_FORMAT_R32_FLOAT,       1, 16,
+              D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        };
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+        pso.InputLayout            = { layout, _countof(layout) };
+        pso.pRootSignature         = m_shadowRootSig.Get();
+        pso.VS                     = { m_shadowInstancedVS->GetBufferPointer(),
+                                       m_shadowInstancedVS->GetBufferSize() };
+        pso.PrimitiveTopologyType  = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.SampleMask             = UINT_MAX;
+        pso.RasterizerState        = raster;
+        pso.DepthStencilState      = dsState;
+        pso.NumRenderTargets       = 0;
+        pso.DSVFormat              = DXGI_FORMAT_D32_FLOAT;
+        pso.SampleDesc.Count       = 1;
+
+        if (FAILED(device->CreateGraphicsPipelineState(
+                &pso, IID_PPV_ARGS(&m_shadowInstancedPSO))))
+            return false;
+    }
+    return true;
+}
+
+void RenderingSystem::ComputeCascades()
+{
+    const XMFLOAT3 camPosF  = m_context.GetCameraPosition();
+    const XMFLOAT3 camTgtF  = m_context.GetCameraTarget();
+    XMVECTOR eye    = XMLoadFloat3(&camPosF);
+    XMVECTOR target = XMLoadFloat3(&camTgtF);
+    XMVECTOR up     = XMVectorSet(0.f, 1.f, 0.f, 0.f);
+
+    XMMATRIX view    = XMMatrixLookAtLH(eye, target, up);
+    XMMATRIX invView = XMMatrixInverse(nullptr, view);
+
+    const float aspect    = (float)m_width / (float)m_height;
+    const float fovY      = XM_PIDIV4;
+    const float nearZ     = 1.0f;
+    const float shadowFar = 1500.0f;
+    const float lambda    = 0.85f;
+
+    // Граница каскадов (log-linear mix)
+    float splits[NumCascades];
+    float ratio = shadowFar / nearZ;
+    for (UINT c = 0; c < NumCascades; ++c)
+    {
+        float p   = (float)(c + 1) / NumCascades;
+        float log = nearZ * powf(ratio, p);
+        float uni = nearZ + (shadowFar - nearZ) * p;
+        splits[c] = lambda * log + (1.f - lambda) * uni;
+    }
+
+    // Направление источника света (совпадает с UpdateLightingConstants)
+    XMVECTOR lightDir = XMVector3Normalize(XMVectorSet(0.88f, -1.0f, -0.34f, 0.f));
+
+    float tanHalfY = tanf(fovY * 0.5f);
+    float tanHalfX = tanHalfY * aspect;
+
+    float prevZ = nearZ;
+    for (UINT c = 0; c < NumCascades; ++c)
+    {
+        float curZ = splits[c];
+
+        // 8 углов frustum-среза в view space
+        XMVECTOR corners[8];
+        float depths[2] = { prevZ, curZ };
+        for (int d = 0; d < 2; ++d)
+        {
+            float z = depths[d];
+            float x = z * tanHalfX;
+            float y = z * tanHalfY;
+            corners[d * 4 + 0] = XMVectorSet(-x,  y, z, 1.f);
+            corners[d * 4 + 1] = XMVectorSet( x,  y, z, 1.f);
+            corners[d * 4 + 2] = XMVectorSet(-x, -y, z, 1.f);
+            corners[d * 4 + 3] = XMVectorSet( x, -y, z, 1.f);
+        }
+
+        // Переводим в world space
+        for (auto& v : corners)
+            v = XMVector4Transform(v, invView);
+
+        // Центр frustum-среза
+        XMVECTOR center = XMVectorZero();
+        for (auto& v : corners) center = XMVectorAdd(center, v);
+        center = XMVectorScale(center, 1.f / 8.f);
+
+        // Радиус ограничивающей сферы
+        float radius = 0.f;
+        for (auto& v : corners)
+        {
+            float d = XMVectorGetX(XMVector3Length(XMVectorSubtract(v, center)));
+            if (d > radius) radius = d;
+        }
+        // Округляем до размера текселя чтобы уменьшить мерцание
+        float texelSize = (radius * 2.f) / (float)ShadowMapSize;
+        radius = ceilf(radius / texelSize) * texelSize;
+
+        // Строим light view: камера смотрит из позиции за сценой вдоль lightDir
+        XMVECTOR lightPos = XMVectorSubtract(
+            center, XMVectorScale(lightDir, radius + 100.f));
+        XMMATRIX lightView = XMMatrixLookAtLH(lightPos, center, up);
+
+        // Ортографическая проекция плотно облегает сферу
+        XMMATRIX lightProj = XMMatrixOrthographicLH(
+            radius * 2.f, radius * 2.f, 0.f, radius * 2.f + 200.f);
+
+        XMMATRIX lightVP = XMMatrixMultiply(lightView, lightProj);
+
+        // Транспонируем для GPU (row-vector convention)
+        XMStoreFloat4x4(&m_cascadeData.LightViewProj[c], XMMatrixTranspose(lightVP));
+
+        prevZ = curZ;
+    }
+
+    m_cascadeData.CascadeSplits = XMFLOAT4(splits[0], splits[1], splits[2], shadowFar);
+
+    // Загружаем в CB для lighting pass
+    memcpy(m_cascadeShadowCBMapped, &m_cascadeData, sizeof(CascadeShadowCB));
+}
+
+void RenderingSystem::RenderShadowPass()
+{
+    if (!m_shadowTerrainPSO || !m_shadowPassCBMapped) return;
+
+    auto* cmd = m_context.GetCommandList();
+
+    // Переходим в DEPTH_WRITE (в первом кадре уже в этом состоянии)
+    if (m_shadowMapsReadable)
+    {
+        D3D12_RESOURCE_BARRIER barriers[NumCascades]{};
+        for (UINT c = 0; c < NumCascades; ++c)
+        {
+            barriers[c].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[c].Transition.pResource   = m_shadowMaps[c].Get();
+            barriers[c].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barriers[c].Transition.StateAfter  = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            barriers[c].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmd->ResourceBarrier(NumCascades, barriers);
+    }
+
+    D3D12_VIEWPORT svp{ 0.f, 0.f, (float)ShadowMapSize, (float)ShadowMapSize, 0.f, 1.f };
+    D3D12_RECT     ssc{ 0, 0, (LONG)ShadowMapSize, (LONG)ShadowMapSize };
+    cmd->RSSetViewports(1, &svp);
+    cmd->RSSetScissorRects(1, &ssc);
+    cmd->SetGraphicsRootSignature(m_shadowRootSig.Get());
+
+    UINT dsvDescSize = m_context.GetDevice()->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    constexpr UINT cbSlot = 256u; // stride между слотами shadow pass CB
+
+    for (UINT c = 0; c < NumCascades; ++c)
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            m_shadowDSVHeap->GetCPUDescriptorHandleForHeapStart();
+        dsv.ptr += c * dsvDescSize;
+
+        cmd->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.f, 0, 0, nullptr);
+        cmd->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+
+        // Кладём LightViewProj каскада c в нужный слот CB
+        memcpy(m_shadowPassCBMapped + c * cbSlot,
+               &m_cascadeData.LightViewProj[c], sizeof(XMFLOAT4X4));
+
+        D3D12_GPU_VIRTUAL_ADDRESS cbAddr =
+            m_shadowPassCB->GetGPUVirtualAddress() + c * cbSlot;
+        cmd->SetGraphicsRootConstantBufferView(0, cbAddr);
+
+        // Рисуем ландшафт
+        cmd->SetPipelineState(m_shadowTerrainPSO.Get());
+        m_context.DrawMeshForShadow(cmd);
+
+        // Рисуем инстансинговые камни
+        if (!m_visibleObjects.empty() && m_shadowInstancedPSO)
+        {
+            cmd->SetPipelineState(m_shadowInstancedPSO.Get());
+            D3D12_VERTEX_BUFFER_VIEW vbViews[2] = { m_cubeVBView, m_instanceVBView };
+            cmd->IASetVertexBuffers(0, 2, vbViews);
+            cmd->IASetIndexBuffer(&m_cubeIBView);
+            cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmd->DrawIndexedInstanced(
+                m_cubeIndexCount, (UINT)m_visibleObjects.size(), 0, 0, 0);
+        }
+    }
+
+    // Переходим в PIXEL_SHADER_RESOURCE для lighting pass
+    {
+        D3D12_RESOURCE_BARRIER barriers[NumCascades]{};
+        for (UINT c = 0; c < NumCascades; ++c)
+        {
+            barriers[c].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[c].Transition.pResource   = m_shadowMaps[c].Get();
+            barriers[c].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            barriers[c].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barriers[c].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        cmd->ResourceBarrier(NumCascades, barriers);
+    }
+    m_shadowMapsReadable = true;
 }
 

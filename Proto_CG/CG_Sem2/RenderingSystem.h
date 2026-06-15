@@ -80,10 +80,20 @@ private:
     void CullAndUpdateInstances();
     void RenderInstances(ID3D12GraphicsCommandList* commandList);
 
+    // --- Каскадные карты теней (CSM) ---
+    bool InitializeShadowResources();
+    bool CompileShadowShaders();
+    bool CreateShadowRootSignature();
+    bool CreateShadowPipelines();
+    void ComputeCascades();
+    void RenderShadowPass();
+
 private:
     static constexpr UINT MaxPointLights = 6;
     static constexpr UINT MaxSpotLights  = 4;
     static constexpr UINT ObjectCount    = 2000;
+    static constexpr UINT NumCascades    = 3;
+    static constexpr UINT ShadowMapSize  = 2048;
     static constexpr float ObjectScale   = 8.0f;
     static constexpr float ObjectRadius  = ObjectScale * 2.0f; // консервативный радиус сферы
 
@@ -123,6 +133,13 @@ private:
     {
         DirectX::XMFLOAT4X4 View;
         DirectX::XMFLOAT4X4 Proj;
+    };
+
+    // Константный буфер каскадных теней (для lighting pass)
+    struct CascadeShadowCB
+    {
+        DirectX::XMFLOAT4X4 LightViewProj[NumCascades]; // транспонированные
+        DirectX::XMFLOAT4   CascadeSplits;              // view-space Z границы каскадов
     };
 
 private:
@@ -175,4 +192,23 @@ private:
     bool m_octreeEnabled         = false;
 
     std::unique_ptr<Octree> m_octree;
+
+    // --- Shadow map resources ---
+    Microsoft::WRL::ComPtr<ID3D12Resource>       m_shadowMaps[NumCascades];
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_shadowDSVHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_lightingSRVHeap;   // GBuffer(0-3) + shadow(4-6)
+    Microsoft::WRL::ComPtr<ID3D12Resource>       m_shadowPassCB;       // per-cascade LightViewProj
+    UINT8*                                        m_shadowPassCBMapped = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource>       m_cascadeShadowCB;    // all cascades for lighting
+    UINT8*                                        m_cascadeShadowCBMapped = nullptr;
+
+    Microsoft::WRL::ComPtr<ID3DBlob>             m_shadowTerrainVS;
+    Microsoft::WRL::ComPtr<ID3DBlob>             m_shadowInstancedVS;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature>  m_shadowRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_shadowTerrainPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState>  m_shadowInstancedPSO;
+
+    CascadeShadowCB m_cascadeData{};
+    UINT            m_lightingSRVDescSize = 0;
+    bool            m_shadowMapsReadable  = false;
 };
