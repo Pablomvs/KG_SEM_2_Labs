@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <cwchar>
+#include <random>
 
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -71,6 +72,26 @@ void RenderingSystem::Shutdown()
         m_deferredLightConstantBuffer->Unmap(0, nullptr);
         m_deferredLightCBMappedData = nullptr;
     }
+
+    if (m_instanceMappedData && m_instanceBuffer)
+    {
+        m_instanceBuffer->Unmap(0, nullptr);
+        m_instanceMappedData = nullptr;
+    }
+    if (m_instancedFrameCBMapped && m_instancedFrameCB)
+    {
+        m_instancedFrameCB->Unmap(0, nullptr);
+        m_instancedFrameCBMapped = nullptr;
+    }
+    m_instanceBuffer.Reset();
+    m_instancedFrameCB.Reset();
+    m_cubeVB.Reset();
+    m_cubeIB.Reset();
+    m_instancedPSO.Reset();
+    m_instancedRootSig.Reset();
+    m_instancedVS.Reset();
+    m_instancedPS.Reset();
+    m_octree.reset();
 
     m_deferredLightConstantBuffer.Reset();
     m_deferredGeometryPSO.Reset();
@@ -189,12 +210,16 @@ void RenderingSystem::RenderOpaqueStage()
     D3D12_RECT sc = m_context.GetScissorRect();
     D3D12_CPU_DESCRIPTOR_HANDLE dsv = m_context.GetDepthStencilView();
 
+    // Отсечение до начала прохода геометрии
+    CullAndUpdateInstances();
+
     commandList->RSSetViewports(1, &vp);
     commandList->RSSetScissorRects(1, &sc);
     commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
     m_gbuffer.BeginGeometryPass(commandList, dsv);
 
+    // Рисуем тесселированный ландшафт
     commandList->SetPipelineState(m_deferredGeometryPSO.Get());
     commandList->SetGraphicsRootSignature(m_context.GetSceneRootSignature());
 
@@ -204,6 +229,10 @@ void RenderingSystem::RenderOpaqueStage()
     m_context.UpdateSceneConstants();
     commandList->SetGraphicsRootConstantBufferView(0, m_context.GetSceneConstantBufferAddress());
     m_context.DrawSceneGeometry(commandList, 1, 2);
+
+    // Рисуем инстансинговые объекты (в те же GBuffer-цели)
+    if (m_instancedPSO && !m_visibleObjects.empty())
+        RenderInstances(commandList);
 
     m_gbuffer.EndGeometryPass(commandList);
 }
@@ -247,7 +276,8 @@ bool RenderingSystem::InitializeDeferredResources()
         CreateDeferredLightingPipeline() &&
         CreateDebugOverlayRootSignature() &&
         CreateDebugOverlayPipeline() &&
-        CreateLightingConstantBuffer();
+        CreateLightingConstantBuffer() &&
+        InitializeInstancedObjects();
 }
 
 bool RenderingSystem::CompileDeferredShaders()
@@ -718,5 +748,328 @@ void RenderingSystem::UpdateLightingConstants()
     XMStoreFloat4x4(&cb.InvProj, XMMatrixTranspose(invProj));
 
     std::memcpy(m_deferredLightCBMappedData, &cb, sizeof(cb));
+}
+
+// ============================================================
+// Инстансинг + фрустум-отсечение + октодерево
+// ============================================================
+
+bool RenderingSystem::InitializeInstancedObjects()
+{
+    // Генерируем случайные позиции в пределах плоскости (XZ: [-270, 270])
+    m_allObjects.clear();
+    m_allObjects.reserve(ObjectCount);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> posXZ(-270.f, 270.f);
+    std::uniform_real_distribution<float> scaleVar(0.6f, 1.5f);
+    std::uniform_real_distribution<float> yawDist(0.f, 6.2832f); // 0..2π
+
+    for (UINT i = 0; i < ObjectCount; ++i)
+    {
+        InstanceData obj;
+        obj.Scale    = ObjectScale * scaleVar(rng);
+        obj.Yaw      = yawDist(rng);
+        // Y=0: основание лежит на поверхности земли (куб идёт от 0 до +1 по Y)
+        obj.WorldPos = { posXZ(rng), 0.0f, posXZ(rng) };
+        m_allObjects.push_back(obj);
+    }
+
+    // Строим октодерево по центрам объектов
+    std::vector<XMFLOAT3> positions(ObjectCount);
+    for (UINT i = 0; i < ObjectCount; ++i) positions[i] = m_allObjects[i].WorldPos;
+
+    m_octree = std::make_unique<Octree>();
+    m_octree->Build(positions, ObjectRadius, 320.f);
+
+    m_visibleObjects.reserve(ObjectCount);
+
+    return CompileInstancedShader()      &&
+           CreateInstancedRootSignature() &&
+           CreateInstancedPipeline()      &&
+           CreateInstancedGeometry()      &&
+           CreateInstanceBuffer()         &&
+           CreateInstancedCB();
+}
+
+bool RenderingSystem::CompileInstancedShader()
+{
+    UINT flags = 0;
+#if defined(_DEBUG)
+    flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+    wchar_t path[MAX_PATH];
+    if (!ResolveShaderPath(L"Instanced.hlsl", path, MAX_PATH))
+        return false;
+
+    ComPtr<ID3DBlob> err;
+    if (FAILED(D3DCompileFromFile(path, nullptr, nullptr, "VSMain", "vs_5_0", flags, 0, &m_instancedVS, &err)))
+        return false;
+
+    return SUCCEEDED(D3DCompileFromFile(path, nullptr, nullptr, "PSMain", "ps_5_0", flags, 0, &m_instancedPS, &err));
+}
+
+bool RenderingSystem::CreateInstancedRootSignature()
+{
+    // Только один CBV (b0) — View и Proj матрицы
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType             = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    param.Descriptor.ShaderRegister = 0;
+    param.ShaderVisibility          = D3D12_SHADER_VISIBILITY_VERTEX;
+
+    D3D12_ROOT_SIGNATURE_DESC desc{};
+    desc.NumParameters = 1;
+    desc.pParameters   = &param;
+    desc.Flags         = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> blob, err;
+    HRESULT hr = D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err);
+    if (FAILED(hr)) return false;
+
+    return SUCCEEDED(m_context.GetDevice()->CreateRootSignature(
+        0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&m_instancedRootSig)));
+}
+
+bool RenderingSystem::CreateInstancedPipeline()
+{
+    D3D12_INPUT_ELEMENT_DESC layout[] =
+    {
+        // Поток 0: геометрия куба (PER_VERTEX)
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,  0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,   0 },
+        { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,   0 },
+        // Поток 1: данные инстанса (PER_INSTANCE, шаг 1)
+        { "IPOS",     0, DXGI_FORMAT_R32G32B32_FLOAT, 1,  0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "ISCALE",   0, DXGI_FORMAT_R32_FLOAT,       1, 12, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "IYAW",     0, DXGI_FORMAT_R32_FLOAT,       1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.InputLayout               = { layout, _countof(layout) };
+    pso.pRootSignature            = m_instancedRootSig.Get();
+    pso.VS = { m_instancedVS->GetBufferPointer(), m_instancedVS->GetBufferSize() };
+    pso.PS = { m_instancedPS->GetBufferPointer(), m_instancedPS->GetBufferSize() };
+    pso.PrimitiveTopologyType     = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.SampleMask                = UINT_MAX;
+    pso.RasterizerState.FillMode  = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode  = D3D12_CULL_MODE_BACK;
+    pso.RasterizerState.FrontCounterClockwise = FALSE;
+    pso.RasterizerState.DepthClipEnable       = TRUE;
+    pso.BlendState.IndependentBlendEnable     = TRUE;
+    for (UINT i = 0; i < 8; ++i)
+        pso.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.DepthStencilState.DepthEnable    = TRUE;
+    pso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pso.DepthStencilState.DepthFunc      = D3D12_COMPARISON_FUNC_LESS;
+    pso.DepthStencilState.StencilEnable  = FALSE;
+    pso.NumRenderTargets = GBuffer::TargetCount;
+    pso.RTVFormats[0]    = m_gbuffer.GetFormat(GBuffer::Slot::AlbedoSpec);
+    pso.RTVFormats[1]    = m_gbuffer.GetFormat(GBuffer::Slot::WorldPosition);
+    pso.RTVFormats[2]    = m_gbuffer.GetFormat(GBuffer::Slot::Normal);
+    pso.RTVFormats[3]    = m_gbuffer.GetFormat(GBuffer::Slot::Depth);
+    pso.DSVFormat        = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pso.SampleDesc.Count = 1;
+
+    return SUCCEEDED(m_context.GetDevice()->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_instancedPSO)));
+}
+
+bool RenderingSystem::CreateInstancedGeometry()
+{
+    // Форма камня: основание (y=0) широкое, верхушка (y=1) уже.
+    // b=0.95 — ширина основания, t=0.65 — ширина верхушки.
+    // Куб: 24 вершины (4 на грань × 6 граней), 36 индексов
+    const float b = 0.95f, t = 0.65f;
+    const InstanceVertex cubeVerts[] =
+    {
+        // Передняя (z наружу, n=(0,0,-1))
+        {{-b, 0,-b},{0,0,-1}}, {{ b, 0,-b},{0,0,-1}}, {{ t, 1,-t},{0,0,-1}}, {{-t, 1,-t},{0,0,-1}},
+        // Задняя
+        {{ b, 0, b},{0,0, 1}}, {{-b, 0, b},{0,0, 1}}, {{-t, 1, t},{0,0, 1}}, {{ t, 1, t},{0,0, 1}},
+        // Левая
+        {{-b, 0, b},{-1,0,0}}, {{-b, 0,-b},{-1,0,0}}, {{-t, 1,-t},{-1,0,0}}, {{-t, 1, t},{-1,0,0}},
+        // Правая
+        {{ b, 0,-b},{ 1,0,0}}, {{ b, 0, b},{ 1,0,0}}, {{ t, 1, t},{ 1,0,0}}, {{ t, 1,-t},{ 1,0,0}},
+        // Нижняя (y=0, на земле — невидима, но нужна для полноты)
+        {{-b, 0, b},{0,-1,0}}, {{ b, 0, b},{0,-1,0}}, {{ b, 0,-b},{0,-1,0}}, {{-b, 0,-b},{0,-1,0}},
+        // Верхняя (y=1, плоский верх)
+        {{-t, 1,-t},{0, 1,0}}, {{ t, 1,-t},{0, 1,0}}, {{ t, 1, t},{0, 1,0}}, {{-t, 1, t},{0, 1,0}},
+    };
+    const UINT16 cubeIdx[] =
+    {
+         0, 1, 2,  0, 2, 3,
+         4, 5, 6,  4, 6, 7,
+         8, 9,10,  8,10,11,
+        12,13,14, 12,14,15,
+        16,17,18, 16,18,19,
+        20,21,22, 20,22,23,
+    };
+    m_cubeIndexCount = _countof(cubeIdx);
+
+    D3D12_HEAP_PROPERTIES up{};
+    up.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    auto makeBuffer = [&](UINT byteSize, ComPtr<ID3D12Resource>& outRes) -> bool
+    {
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width              = byteSize;
+        bd.Height             = 1;
+        bd.DepthOrArraySize   = 1;
+        bd.MipLevels          = 1;
+        bd.SampleDesc.Count   = 1;
+        bd.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return SUCCEEDED(m_context.GetDevice()->CreateCommittedResource(
+            &up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&outRes)));
+    };
+
+    // Vertex buffer
+    const UINT vbSize = sizeof(cubeVerts);
+    if (!makeBuffer(vbSize, m_cubeVB)) return false;
+    UINT8* vbData;
+    if (FAILED(m_cubeVB->Map(0, nullptr, (void**)&vbData))) return false;
+    memcpy(vbData, cubeVerts, vbSize);
+    m_cubeVB->Unmap(0, nullptr);
+    // D3D12_VERTEX_BUFFER_VIEW: BufferLocation, SizeInBytes, StrideInBytes
+    m_cubeVBView = { m_cubeVB->GetGPUVirtualAddress(), vbSize, sizeof(InstanceVertex) };
+
+    // Index buffer
+    const UINT ibSize = sizeof(cubeIdx);
+    if (!makeBuffer(ibSize, m_cubeIB)) return false;
+    UINT8* ibData;
+    if (FAILED(m_cubeIB->Map(0, nullptr, (void**)&ibData))) return false;
+    memcpy(ibData, cubeIdx, ibSize);
+    m_cubeIB->Unmap(0, nullptr);
+    m_cubeIBView = { m_cubeIB->GetGPUVirtualAddress(), ibSize, DXGI_FORMAT_R16_UINT };
+
+    return true;
+}
+
+bool RenderingSystem::CreateInstanceBuffer()
+{
+    const UINT bufSize = ObjectCount * sizeof(InstanceData);
+
+    D3D12_HEAP_PROPERTIES up{};
+    up.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = bufSize;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    if (FAILED(m_context.GetDevice()->CreateCommittedResource(
+        &up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr, IID_PPV_ARGS(&m_instanceBuffer)))) return false;
+
+    D3D12_RANGE readRange{0, 0};
+    if (FAILED(m_instanceBuffer->Map(0, &readRange, (void**)&m_instanceMappedData))) return false;
+
+    m_instanceVBView = { m_instanceBuffer->GetGPUVirtualAddress(), bufSize, sizeof(InstanceData) };
+    return true;
+}
+
+bool RenderingSystem::CreateInstancedCB()
+{
+    const UINT cbSize = (sizeof(PerFrameInstancedCB) + 255) & ~255u;
+
+    D3D12_HEAP_PROPERTIES up{};
+    up.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = cbSize;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    if (FAILED(m_context.GetDevice()->CreateCommittedResource(
+        &up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr, IID_PPV_ARGS(&m_instancedFrameCB)))) return false;
+
+    D3D12_RANGE readRange{0, 0};
+    return SUCCEEDED(m_instancedFrameCB->Map(0, &readRange, (void**)&m_instancedFrameCBMapped));
+}
+
+void RenderingSystem::CullAndUpdateInstances()
+{
+    m_visibleObjects.clear();
+    if (m_allObjects.empty() || !m_instanceMappedData) return;
+
+    if (!m_frustumCullingEnabled)
+    {
+        // Отсечение выключено — рисуем все объекты
+        m_visibleObjects = m_allObjects;
+    }
+    else
+    {
+        // Строим матрицу ViewProj для извлечения плоскостей фрустума
+        const XMFLOAT3 camPosF = m_context.GetCameraPosition();
+        const XMFLOAT3 camTgtF = m_context.GetCameraTarget();
+        XMVECTOR camPos = XMLoadFloat3(&camPosF);
+        XMVECTOR camTgt = XMLoadFloat3(&camTgtF);
+        XMVECTOR up     = XMVectorSet(0.f, 1.f, 0.f, 0.f);
+        XMMATRIX view   = XMMatrixLookAtLH(camPos, camTgt, up);
+        XMMATRIX proj   = XMMatrixPerspectiveFovLH(
+            XM_PIDIV4, (float)m_width / (float)m_height, 1.f, 20000.f);
+        XMMATRIX vp = XMMatrixMultiply(view, proj);
+
+        XMFLOAT4X4 vpF;
+        XMStoreFloat4x4(&vpF, vp);
+
+        FrustumPlane planes[6];
+        ExtractFrustumPlanes(vpF, planes);
+
+        if (m_octreeEnabled && m_octree)
+        {
+            // Отсечение через октодерево
+            std::vector<int> indices;
+            m_octree->QueryFrustum(planes, indices);
+            for (int idx : indices)
+                m_visibleObjects.push_back(m_allObjects[idx]);
+        }
+        else
+        {
+            // Грубая сила: проверяем каждый объект
+            for (const auto& obj : m_allObjects)
+                if (SphereInFrustum(obj.WorldPos, obj.Scale * 1.733f, planes))
+                    m_visibleObjects.push_back(obj);
+        }
+    }
+
+    if (!m_visibleObjects.empty())
+        memcpy(m_instanceMappedData, m_visibleObjects.data(),
+               m_visibleObjects.size() * sizeof(InstanceData));
+}
+
+void RenderingSystem::RenderInstances(ID3D12GraphicsCommandList* commandList)
+{
+    if (m_visibleObjects.empty() || !m_instancedFrameCBMapped) return;
+
+    // Обновляем View/Proj в CB инстансинга
+    const XMFLOAT3 camPosF = m_context.GetCameraPosition();
+    const XMFLOAT3 camTgtF = m_context.GetCameraTarget();
+    XMVECTOR camPos = XMLoadFloat3(&camPosF);
+    XMVECTOR camTgt = XMLoadFloat3(&camTgtF);
+    XMVECTOR up     = XMVectorSet(0.f, 1.f, 0.f, 0.f);
+    XMMATRIX view   = XMMatrixLookAtLH(camPos, camTgt, up);
+    XMMATRIX proj   = XMMatrixPerspectiveFovLH(
+        XM_PIDIV4, (float)m_width / (float)m_height, 1.f, 20000.f);
+
+    PerFrameInstancedCB cb;
+    XMStoreFloat4x4(&cb.View, XMMatrixTranspose(view));
+    XMStoreFloat4x4(&cb.Proj, XMMatrixTranspose(proj));
+    memcpy(m_instancedFrameCBMapped, &cb, sizeof(cb));
+
+    commandList->SetPipelineState(m_instancedPSO.Get());
+    commandList->SetGraphicsRootSignature(m_instancedRootSig.Get());
+    commandList->SetGraphicsRootConstantBufferView(0, m_instancedFrameCB->GetGPUVirtualAddress());
+
+    D3D12_VERTEX_BUFFER_VIEW vbViews[2] = { m_cubeVBView, m_instanceVBView };
+    commandList->IASetVertexBuffers(0, 2, vbViews);
+    commandList->IASetIndexBuffer(&m_cubeIBView);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList->DrawIndexedInstanced(m_cubeIndexCount, (UINT)m_visibleObjects.size(), 0, 0, 0);
 }
 

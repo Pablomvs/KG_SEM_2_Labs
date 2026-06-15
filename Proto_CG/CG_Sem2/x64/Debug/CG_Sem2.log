@@ -1,2 +1,5 @@
-﻿  D3D12Context.cpp
+﻿  Application.cpp
+  RenderingSystem.cpp
+  main.cpp
+  Создание кода...
   CG_Sem2.vcxproj -> C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\x64\Debug\CG_Sem2.exe

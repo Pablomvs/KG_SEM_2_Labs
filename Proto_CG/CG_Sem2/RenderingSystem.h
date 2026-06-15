@@ -6,9 +6,12 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <wrl.h>
+#include <memory>
+#include <vector>
 
 #include "D3D12Context.h"
 #include "GBuffer.h"
+#include "Octree.h"
 
 class RenderingSystem
 {
@@ -41,6 +44,14 @@ public:
 
     void RenderFrame();
 
+    // --- Управление отсечением ---
+    void ToggleFrustumCulling() { m_frustumCullingEnabled = !m_frustumCullingEnabled; }
+    void ToggleOctree()         { m_octreeEnabled = !m_octreeEnabled; }
+    bool IsFrustumCullingEnabled() const { return m_frustumCullingEnabled; }
+    bool IsOctreeEnabled()         const { return m_octreeEnabled; }
+    UINT GetVisibleCount()         const { return (UINT)m_visibleObjects.size(); }
+    UINT GetTotalCount()           const { return (UINT)m_allObjects.size(); }
+
 private:
     void RenderForwardFrame();
     void RenderDeferredFrame();
@@ -58,9 +69,23 @@ private:
     bool CreateLightingConstantBuffer();
     void UpdateLightingConstants();
 
+    // --- Инстансинг и отсечение ---
+    bool InitializeInstancedObjects();
+    bool CompileInstancedShader();
+    bool CreateInstancedRootSignature();
+    bool CreateInstancedPipeline();
+    bool CreateInstancedGeometry();
+    bool CreateInstanceBuffer();
+    bool CreateInstancedCB();
+    void CullAndUpdateInstances();
+    void RenderInstances(ID3D12GraphicsCommandList* commandList);
+
 private:
     static constexpr UINT MaxPointLights = 6;
-    static constexpr UINT MaxSpotLights = 4;
+    static constexpr UINT MaxSpotLights  = 4;
+    static constexpr UINT ObjectCount    = 2000;
+    static constexpr float ObjectScale   = 8.0f;
+    static constexpr float ObjectRadius  = ObjectScale * 2.0f; // консервативный радиус сферы
 
     struct DeferredLightCB
     {
@@ -78,14 +103,37 @@ private:
         DirectX::XMFLOAT4X4 InvProj;
     };
 
+    // Данные одного инстанса (поток 1, PER_INSTANCE_DATA)
+    struct InstanceData
+    {
+        DirectX::XMFLOAT3 WorldPos;
+        float              Scale;
+        float              Yaw;   // случайный поворот вокруг Y
+    };
+
+    // Вершина куба (поток 0, PER_VERTEX_DATA)
+    struct InstanceVertex
+    {
+        DirectX::XMFLOAT3 Pos;
+        DirectX::XMFLOAT3 Norm;
+    };
+
+    // Константный буфер для шейдера инстансинга
+    struct PerFrameInstancedCB
+    {
+        DirectX::XMFLOAT4X4 View;
+        DirectX::XMFLOAT4X4 Proj;
+    };
+
 private:
     D3D12Context m_context;
-    GBuffer m_gbuffer;
-    Technique m_technique = Technique::Forward;
-    float m_clearColor[4] = { 0.48f, 0.52f, 0.80f, 1.0f };
-    UINT m_width = 0;
-    UINT m_height = 0;
+    GBuffer      m_gbuffer;
+    Technique    m_technique   = Technique::Forward;
+    float        m_clearColor[4] = { 0.48f, 0.52f, 0.80f, 1.0f };
+    UINT         m_width  = 0;
+    UINT         m_height = 0;
 
+    // Шейдеры и PSO для отложенного рендеринга
     Microsoft::WRL::ComPtr<ID3DBlob> m_deferredGeometryVS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_deferredGeometryHS;
     Microsoft::WRL::ComPtr<ID3DBlob> m_deferredGeometryDS;
@@ -99,6 +147,32 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_deferredGeometryPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_deferredLightingPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_debugOverlayPSO;
-    Microsoft::WRL::ComPtr<ID3D12Resource> m_deferredLightConstantBuffer;
-    UINT8* m_deferredLightCBMappedData = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_deferredLightConstantBuffer;
+    UINT8*                                       m_deferredLightCBMappedData = nullptr;
+
+    // Инстансинг
+    Microsoft::WRL::ComPtr<ID3DBlob>            m_instancedVS;
+    Microsoft::WRL::ComPtr<ID3DBlob>            m_instancedPS;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_instancedRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_instancedPSO;
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_cubeVB;
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_cubeIB;
+    D3D12_VERTEX_BUFFER_VIEW                    m_cubeVBView{};
+    D3D12_INDEX_BUFFER_VIEW                     m_cubeIBView{};
+    UINT                                         m_cubeIndexCount = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_instanceBuffer;
+    D3D12_VERTEX_BUFFER_VIEW                    m_instanceVBView{};
+    UINT8*                                       m_instanceMappedData = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Resource>      m_instancedFrameCB;
+    UINT8*                                       m_instancedFrameCBMapped = nullptr;
+
+    // Данные объектов сцены
+    std::vector<InstanceData> m_allObjects;
+    std::vector<InstanceData> m_visibleObjects;
+
+    // Состояние отсечения
+    bool m_frustumCullingEnabled = true;
+    bool m_octreeEnabled         = false;
+
+    std::unique_ptr<Octree> m_octree;
 };

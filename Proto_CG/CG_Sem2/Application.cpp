@@ -40,6 +40,8 @@ bool Application::Initialize()
 int Application::Run()
 {
     MSG msg{};
+    bool fPrev = false, oPrev = false;
+
     while (true)
     {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
@@ -57,6 +59,14 @@ int Application::Run()
             continue;
         }
 
+        // Переключение отсечения: F = фрустум-отсечение, O = режим октодерева
+        bool fNow = (GetAsyncKeyState('F') & 0x8000) != 0;
+        bool oNow = (GetAsyncKeyState('O') & 0x8000) != 0;
+        if (fNow && !fPrev) m_renderingSystem.ToggleFrustumCulling();
+        if (oNow && !oPrev) m_renderingSystem.ToggleOctree();
+        fPrev = fNow;
+        oPrev = oNow;
+
         m_timer.Tick();
         float deltaTime = m_timer.DeltaTime();
 
@@ -70,10 +80,9 @@ int Application::Run()
         }
         m_input.ResetMouseDelta();
 
-        // скорость для 
+        // скорость для
         const float rotateSpeed = 0.0035f;
-        const float dollySpeed = 1.5f;
-
+        const float dollySpeed  = 1.5f;
 
         m_renderingSystem.UpdateCameraOrbit(
             deltaTime,
@@ -86,5 +95,15 @@ int Application::Run()
 
         m_renderingSystem.SetTime(m_timer.TotalTime());
         m_renderingSystem.RenderFrame();
+
+        // Показываем статистику отсечения в заголовке окна
+        wchar_t titleBuf[256];
+        swprintf_s(titleBuf, 256,
+            L"KG_Lab4  |  Objects: %u / %u  |  Culling[F]: %s  |  Octree[O]: %s",
+            m_renderingSystem.GetVisibleCount(),
+            m_renderingSystem.GetTotalCount(),
+            m_renderingSystem.IsFrustumCullingEnabled() ? L"ON" : L"OFF",
+            m_renderingSystem.IsOctreeEnabled()         ? L"ON" : L"OFF");
+        SetWindowTextW(m_window.GetHWND(), titleBuf);
     }
 }
