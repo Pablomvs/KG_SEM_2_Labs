@@ -11,10 +11,10 @@ bool Application::Initialize()
     if (!m_window.Create(
         m_hInstance,
         m_nCmdShow,
-        1200,
-        1000,
+        800,
+        600,
         L"DX12WindowClass",
-        L"KG_Laba4 - Deferred Rendering"))
+        L"KG_Laba4 - DX12 Final"))
     {
         MessageBoxW(nullptr, L"Window Create FAILED", L"Error", MB_OK);
         return false;
@@ -24,11 +24,14 @@ bool Application::Initialize()
 
     if (!m_renderingSystem.Initialize(m_window.GetHWND(), 1200, 1000))
     {
-        MessageBoxW(nullptr, L"RenderingSystem Initialize FAILED (see Output window)", L"Error", MB_OK);
+        MessageBoxW(nullptr, L"DX12 Initialize FAILED (see Output window)", L"Error", MB_OK);
         return false;
     }
-
+    
     m_renderingSystem.SetTechnique(RenderingSystem::Technique::Deferred);
+    m_renderingSystem.SetUVTiling(1.0f, 1.0f);
+    m_renderingSystem.SetUVScrollSpeed(0.0f, 0.0f);
+    m_renderingSystem.SetClearColor(0.48f, 0.52f, 0.80f, 1.0f);
 
     m_timer.Reset();
     return true;
@@ -58,17 +61,24 @@ int Application::Run()
         float deltaTime = m_timer.DeltaTime();
 
         bool orbitRotate = m_input.IsMouseButtonDown(VK_RBUTTON);
-        bool dolly       = m_input.IsMouseButtonDown(VK_LBUTTON);
+        bool dolly = m_input.IsMouseButtonDown(VK_LBUTTON);
 
         int mouseDeltaX = 0, mouseDeltaY = 0;
         if (orbitRotate || dolly)
+        {
             m_input.GetMouseDelta(mouseDeltaX, mouseDeltaY);
+        }
         m_input.ResetMouseDelta();
+
+        // скорость для 
+        const float rotateSpeed = 0.0035f;
+        const float dollySpeed = 1.5f;
+
 
         m_renderingSystem.UpdateCameraOrbit(
             deltaTime,
-            0.005f,
-            0.2f,
+            rotateSpeed,
+            dollySpeed,
             orbitRotate,
             dolly,
             (float)mouseDeltaX,

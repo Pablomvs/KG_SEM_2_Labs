@@ -15,11 +15,11 @@ public:
     int  Run();
 
 private:
-    HINSTANCE m_hInstance{};
-    int       m_nCmdShow{};
+    HINSTANCE   m_hInstance{}; 
+    int         m_nCmdShow{};
 
-    Win32Window     m_window;
-    GameTimer       m_timer;
+    Win32Window  m_window;
+    GameTimer    m_timer;
     RenderingSystem m_renderingSystem;
-    InputDevice     m_input;
+    InputDevice  m_input;
 };

@@ -1,11 +1,11 @@
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\Application.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\Application.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\CubeGeometry.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\CubeGeometry.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\D3D12Context.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\D3D12Context.obj
-C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\GBuffer.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\GBuffer.obj
-C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\RenderingSystem.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\RenderingSystem.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\GameTimer.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\GameTimer.obj
+C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\GBuffer.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\GBuffer.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\InputDevice.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\InputDevice.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\main.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\main.obj
+C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\RenderingSystem.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\RenderingSystem.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\tiny_obj_loader.cc;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\tiny_obj_loader.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\Vertex.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\Vertex.obj
 C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\Win32Window.cpp;C:\Users\Home\Desktop\KG_Sem2_labs\Proto_CG\CG_Sem2\x64\Debug\Win32Window.obj
